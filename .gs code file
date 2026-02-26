@@ -1,0 +1,177 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SPREADSHEET_ID = 'YOUR_ANONYMIZED_SPREADSHEET_ID';
+const SIM_SHEET_NAME = 'eSims Dispenser';      // Hidden sheet with inventory data
+const LOG_SHEET_NAME = 'Event_Log';            // Visible audit log
+
+// Column indices (0-based)
+const COL = {
+  ICCID: 0,
+  QR_CODE: 1,
+  BAN: 2,
+  NUM_REQUESTED: 3,
+  REQUEST_ID: 4,
+  TIMESTAMP: 5
+};
+
+// Business rules
+const RULES = {
+  EMAIL_DOMAIN: '@[COMPANY_DOMAIN]',
+  MIN_QUANTITY: 1,
+  MAX_QUANTITY: 10
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CACHE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+function clearCache() {
+  SpreadsheetApp.flush();
+  Utilities.sleep(100); 
+}
+
+function getFreshSpreadsheet() {
+  clearCache();
+  return SpreadsheetApp.openById(SPREADSHEET_ID);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE BUSINESS LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+
+/**
+ * Main function: Validates inputs and dispenses eSIMs
+ * * @param {string} email - Requester's email address
+ * @param {string} accountNumber - Customer account number (BAN)
+ * @param {number} quantity - Number of eSIMs requested
+ */
+function validateAndDispenseSIMs(email, accountNumber, quantity) {
+  try {
+    // Step 1: Validate inputs
+    const validation = validateInputs(email, accountNumber, quantity);
+    if (!validation.valid) {
+      logTransaction(email, accountNumber, quantity, 'Failed - ' + validation.error);
+      return { success: false, error: validation.error };
+    }
+    
+    // Step 2: Find available SIMs in inventory
+    const availableSIMs = findAvailableSIMs(quantity);
+    if (availableSIMs.error) {
+      logTransaction(email, accountNumber, quantity, 'Failed - ' + availableSIMs.error);
+      return { success: false, error: availableSIMs.error };
+    }
+    
+    // Step 3: Dispense SIMs and update inventory status
+    const dispensedSIMs = dispenseSIMs(availableSIMs.sims, email, accountNumber, quantity);
+    
+    // Step 4: Log successful transaction to audit trail
+    logTransaction(email, accountNumber, quantity, 'Success - ' + quantity + ' eSIM(s) dispensed');
+
+    // Step 5: Send Google Chat notification via Webhook
+    sendChatNotification(email, quantity);
+
+    return {
+      success: true,
+      sims: dispensedSIMs,
+      message: `Successfully dispensed ${quantity} eSIM(s)`
+    };
+
+  } catch (error) {
+    Logger.log('CRITICAL ERROR: ' + error.toString());
+    logTransaction(email || 'Unknown', accountNumber || 'N/A', quantity || 0, 'Failed - System Error: ' + error.message);
+    return { success: false, error: 'System error: ' + error.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INVENTORY MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+
+function findAvailableSIMs(quantity) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SIM_SHEET_NAME);
+  
+  if (!sheet) return { error: 'Inventory sheet not found.' };
+
+  const data = sheet.getDataRange().getValues();
+  const availableSIMs = [];
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const iccid = row[COL.ICCID];
+    const qrCode = row[COL.QR_CODE];
+    const ban = row[COL.BAN];
+    const timestamp = row[COL.TIMESTAMP];
+    
+    // Availability Logic: Has code, no assigned account (BAN), no timestamp
+    if (iccid && qrCode && !ban && !timestamp) {
+      availableSIMs.push({
+        rowIndex: i + 1, 
+        iccid: iccid,
+        qrCodeUrl: qrCode
+      });
+      
+      if (availableSIMs.length >= quantity) break;
+    }
+  }
+  
+  if (availableSIMs.length < quantity) {
+    return { error: `Insufficient inventory. Available: ${availableSIMs.length}. Requested: ${quantity}.` };
+  }
+  
+  return { sims: availableSIMs };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GOOGLE CHAT NOTIFICATIONS (ANONYMIZED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function sendChatNotification(email, quantity) {
+  try {
+    const webhookUrl = 'https://chat.googleapis.com/v1/spaces/ANONYMIZED_WEBHOOK_URL';
+    const remainingCount = countRemainingESIMs();
+    
+    const message = {
+      text: `🚀 ${email} dispensed ${quantity} eSIM(s). Inventory remaining: ${remainingCount}.`
+    };
+    
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(message),
+      muteHttpExceptions: true
+    };
+    
+    UrlFetchApp.fetch(webhookUrl, options);
+  } catch (error) {
+    Logger.log('Notification failed: ' + error.toString());
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUDIT LOGGING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function logTransaction(email, accountNumber, quantity, status) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  let logSheet = ss.getSheetByName(LOG_SHEET_NAME) || ss.insertSheet(LOG_SHEET_NAME);
+  
+  const timestamp = new Date();
+  logSheet.appendRow([timestamp, email, accountNumber, quantity, status]);
+  
+  const lastRow = logSheet.getLastRow();
+  const statusCell = logSheet.getRange(lastRow, 5);
+  
+  // UI UX: Conditional formatting for logs
+  if (status.indexOf('Success') > -1) {
+    statusCell.setBackground('#d4edda').setFontColor('#155724');
+  } else {
+    statusCell.setBackground('#f8d7da').setFontColor('#721c24');
+  }
+}
